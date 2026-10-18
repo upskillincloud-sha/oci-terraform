@@ -1,0 +1,82 @@
+# Reusable apply workflow, called once per environment from terraform.yml.
+#   approve : sits on the "<env>-approval" GitHub environment (required reviewers) -> manual gate
+#   apply   : runs on the "<env>" GitHub environment (config vars/secrets) and applies the saved plan
+
+name: Terraform apply
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      working-directory:
+        type: string
+        required: true
+      terraform-version:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  approve:
+    name: Approve ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-approval
+    steps:
+      - run: echo "Apply to ${{ inputs.environment }} approved by ${{ github.actor }}"
+
+  apply:
+    name: Apply ${{ inputs.environment }}
+    needs: approve
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write # push state to the tfstate branch
+    concurrency:
+      group: tfstate-${{ inputs.environment }} # one writer per env state file at a time
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Set up Terraform and load config
+        uses: ./.github/actions/terraform-setup
+        with:
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          terraform-version: ${{ inputs.terraform-version }}
+          vars-json: ${{ toJSON(vars) }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: Load ${{ inputs.environment }} state from GitHub
+        id: pull
+        uses: ./.github/actions/tfstate
+        with:
+          mode: pull
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
+          allow-empty: ${{ vars.TF_ALLOW_EMPTY_STATE == 'true' && 'true' || 'false' }}
+
+      - name: terraform apply (saved plan)
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Save ${{ inputs.environment }} state to GitHub
+        if: always() && steps.pull.outcome == 'success' # also after a failed apply: keeps partial changes
+        uses: ./.github/actions/tfstate
+        with:
+          mode: push
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
