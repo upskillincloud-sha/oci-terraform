@@ -1,7 +1,7 @@
 # Terraform CI/CD
 #
 #   any branch  : fmt -> detect envs -> plan (dev / test / prod, whichever exist)
-#   default branch (master): fmt -> detect envs -> plan -> [manual approval] -> apply, per env
+#   default branch (master): fmt -> detect envs -> plan (parallel) -> [manual approval] -> apply (parallel), per env
 #
 # All configuration comes from GitHub repository / environment Variables & Secrets.
 # See PIPELINE.md for the one-time setup.
@@ -138,43 +138,19 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------- 3. apply (default branch, manual)
-  # Each env waits for a human to approve on its "<env>-approval" environment.
-  # Order: dev -> test -> prod. An env that doesn't exist is skipped and doesn't block the next.
-  apply-dev:
-    name: Apply dev
+  # One apply per detected env, all in parallel. Each env has its own approval gate
+  # ("<env>-approval" GitHub environment), so you can approve them together or one by one.
+  apply:
+    name: Apply (${{ matrix.env }})
     needs: [detect, plan]
-    if: github.ref_name == github.event.repository.default_branch && contains(fromJSON(needs.detect.outputs.envs), 'dev')
+    if: github.ref_name == github.event.repository.default_branch
+    strategy:
+      fail-fast: false # a failing env doesn't cancel the others
+      matrix:
+        env: ${{ fromJSON(needs.detect.outputs.envs) }}
     uses: ./.github/workflows/terraform-apply.yml
     with:
-      environment: dev
-      working-directory: ${{ vars.TF_ROOT || '.' }}/dev
-      terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
-    secrets: inherit
-
-  apply-test:
-    name: Apply test
-    needs: [detect, plan, apply-dev]
-    if: >-
-      always() && github.ref_name == github.event.repository.default_branch && needs.plan.result == 'success'
-      && contains(fromJSON(needs.detect.outputs.envs), 'test')
-      && (needs.apply-dev.result == 'success' || needs.apply-dev.result == 'skipped')
-    uses: ./.github/workflows/terraform-apply.yml
-    with:
-      environment: test
-      working-directory: ${{ vars.TF_ROOT || '.' }}/test
-      terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
-    secrets: inherit
-
-  apply-prod:
-    name: Apply prod
-    needs: [detect, plan, apply-test]
-    if: >-
-      always() && github.ref_name == github.event.repository.default_branch && needs.plan.result == 'success'
-      && contains(fromJSON(needs.detect.outputs.envs), 'prod')
-      && (needs.apply-test.result == 'success' || needs.apply-test.result == 'skipped')
-    uses: ./.github/workflows/terraform-apply.yml
-    with:
-      environment: prod
-      working-directory: ${{ vars.TF_ROOT || '.' }}/prod
+      environment: ${{ matrix.env }}
+      working-directory: ${{ vars.TF_ROOT || '.' }}/${{ matrix.env }}
       terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
     secrets: inherit

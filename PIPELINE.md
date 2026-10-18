@@ -5,7 +5,7 @@
 | Push to | fmt | plan (dev / test / prod) | apply |
 |---|---|---|---|
 | any branch except `master` | auto-fix + commit | ✅ automatic | — |
-| `master` (default branch) | `fmt -check` | ✅ automatic | ⏸ manual approval per env, dev → test → prod |
+| `master` (default branch) | `fmt -check` | ✅ automatic | ⏸ manual approval per env, all envs in parallel |
 
 * **Environments are auto-detected**: a plan runs for each of `dev/`, `test/`, `prod/` that exists. To include `uat`, set the repo variable `TF_ENVIRONMENTS` to `dev test uat prod`. Each env also needs its own GitHub environment and approval gate.
 * **Apply uses the exact plan that was reviewed** (saved from the plan job). What you approve is what gets applied.
@@ -35,7 +35,7 @@
 
 ## Manual approval
 
-Each env has an `<env>-approval` GitHub environment with **Required reviewers**, restricted to the default branch. A push to `master` pauses at "Approve dev". Open the run, click **Review deployments → Approve**, and the next env waits in turn.
+Each env has an `<env>-approval` GitHub environment with **Required reviewers**, restricted to the default branch. A push to `master` pauses at the approval step for every env at once. Open the run, click **Review deployments**, and tick the envs to apply (all together or one at a time). Each approved env applies in parallel.
 
 ## One-time setup
 
