@@ -1,9 +1,10 @@
 name: Terraform state in GitHub
 description: >
-  Keeps each environment's Terraform state on the "tfstate" branch of this repo as
-  <env>/terraform.tfstate.enc, encrypted with AES-256 using the TF_STATE_PASSPHRASE secret.
-  mode=pull  -> download + decrypt into the working directory (before plan / apply)
-  mode=push  -> encrypt + commit back to the tfstate branch (after apply), only if it changed
+  Keeps each environment's Terraform state on the "tfstate" branch of this repo.
+  No TF_STATE_PASSPHRASE secret -> plain  <env>/terraform.tfstate
+  TF_STATE_PASSPHRASE set       -> AES-256 <env>/terraform.tfstate.enc (next save switches automatically)
+  mode=pull  -> download (+ decrypt) into the working directory (before plan / apply)
+  mode=push  -> (encrypt +) commit back to the tfstate branch (after apply), only if it changed
 
 inputs:
   mode:
@@ -14,8 +15,9 @@ inputs:
   working-directory:
     required: true
   passphrase:
-    description: secrets.TF_STATE_PASSPHRASE
-    required: true
+    description: secrets.TF_STATE_PASSPHRASE (empty = store unencrypted)
+    required: false
+    default: ""
   allow-empty:
     description: "true = an env with no saved state starts empty instead of failing"
     default: "false"
@@ -35,27 +37,31 @@ runs:
         ALLOW_EMPTY: ${{ inputs.allow-empty }}
         STATE_BRANCH: ${{ inputs.branch }}
       run: |
-        if [ -z "$TF_STATE_PASSPHRASE" ]; then
-          echo "::error::Secret TF_STATE_PASSPHRASE is not set (Settings -> Secrets and variables -> Actions -> Secrets)."
-          exit 1
-        fi
         enc_path="$ENV_NAME/terraform.tfstate.enc"
+        plain_path="$ENV_NAME/terraform.tfstate"
         crypt() { openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:TF_STATE_PASSPHRASE "$@"; }
         here="$PWD"
 
         if [ "$MODE" = "pull" ]; then
-          if git fetch -q --depth=1 origin "$STATE_BRANCH" 2>/dev/null \
-             && git cat-file -e "FETCH_HEAD:$enc_path" 2>/dev/null; then
+          git fetch -q --depth=1 origin "$STATE_BRANCH" 2>/dev/null || true
+          if git cat-file -e "FETCH_HEAD:$enc_path" 2>/dev/null; then
+            [ -n "$TF_STATE_PASSPHRASE" ] || { echo "::error::$enc_path is encrypted but secret TF_STATE_PASSPHRASE is not set."; exit 1; }
             git show "FETCH_HEAD:$enc_path" | crypt -d -out "$RUNNER_TEMP/dec.tfstate" \
               || { echo "::error::Could not decrypt $enc_path - is TF_STATE_PASSPHRASE the one it was saved with?"; exit 1; }
             mv "$RUNNER_TEMP/dec.tfstate" terraform.tfstate
+            loaded="$enc_path (encrypted)"
+          elif git cat-file -e "FETCH_HEAD:$plain_path" 2>/dev/null; then
+            git show "FETCH_HEAD:$plain_path" > terraform.tfstate
+            loaded="$plain_path"
+          fi
+          if [ -n "${loaded:-}" ]; then
             sha256sum terraform.tfstate | cut -d' ' -f1 > "$RUNNER_TEMP/tfstate-$ENV_NAME.sha"
-            echo "::notice::$ENV_NAME: loaded state from branch '$STATE_BRANCH' ($enc_path)"
+            echo "::notice::$ENV_NAME: loaded state from branch '$STATE_BRANCH' ($loaded)"
           elif [ "$ALLOW_EMPTY" = "true" ]; then
             echo "none" > "$RUNNER_TEMP/tfstate-$ENV_NAME.sha"
             echo "::warning::$ENV_NAME: no saved state on branch '$STATE_BRANCH' - running with EMPTY state (plan will show everything as new)."
           else
-            echo "::error::$ENV_NAME: no saved state at $STATE_BRANCH:$enc_path. Upload the existing state first (scripts/tfstate.sh push $ENV_NAME) - or, for a brand-new env, set repo variable TF_ALLOW_EMPTY_STATE=true."
+            echo "::error::$ENV_NAME: no saved state at $STATE_BRANCH:$plain_path. Upload the existing state first (scripts/tfstate.sh push $ENV_NAME) - or, for a brand-new env, set repo variable TF_ALLOW_EMPTY_STATE=true."
             exit 1
           fi
           exit 0
@@ -68,6 +74,7 @@ runs:
           echo "::notice::$ENV_NAME: state unchanged - nothing to save."; exit 0
         fi
         wt="$RUNNER_TEMP/tfstate-wt-$ENV_NAME"
+        git worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
         git config user.name  "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         if git fetch -q --depth=50 origin "$STATE_BRANCH" 2>/dev/null; then
@@ -78,20 +85,26 @@ runs:
           git -C "$wt" rm -rq --cached . && git -C "$wt" clean -fdxq
         fi
         mkdir -p "$wt/$ENV_NAME"
-        crypt -in "$here/terraform.tfstate" -out "$wt/$enc_path"
-        git -C "$wt" add -f "$enc_path"
+        if [ -n "$TF_STATE_PASSPHRASE" ]; then
+          crypt -in "$here/terraform.tfstate" -out "$wt/$enc_path"; saved="$enc_path"
+          git -C "$wt" rm -q --ignore-unmatch "$plain_path"
+        else
+          cp "$here/terraform.tfstate" "$wt/$plain_path"; saved="$plain_path"
+          git -C "$wt" rm -q --ignore-unmatch "$enc_path"
+        fi
+        git -C "$wt" add -f "$saved"
         git -C "$wt" commit -qm "state($ENV_NAME): ${GITHUB_SHA::7} run ${GITHUB_RUN_ID}"
         # applies for other envs may push at the same time (different files) -> rebase and retry
         for i in 1 2 3 4 5 6; do
           if git -C "$wt" push -q origin "HEAD:refs/heads/$STATE_BRANCH"; then
-            echo "::notice::$ENV_NAME: state saved to $STATE_BRANCH:$enc_path"; exit 0
+            echo "::notice::$ENV_NAME: state saved to $STATE_BRANCH:$saved"; exit 0
           fi
           sleep $((i * 2))
           git -C "$wt" fetch -q --depth=50 origin "$STATE_BRANCH" && git -C "$wt" rebase -q FETCH_HEAD
         done
         # last resort so the new state is never lost: keep an encrypted copy as a run artifact
-        cp "$wt/$enc_path" "$RUNNER_TEMP/unsaved-$ENV_NAME.tfstate.enc"
-        echo "::error::$ENV_NAME: could not push state. Encrypted copy kept as artifact 'unsaved-state-$ENV_NAME'."
+        cp "$wt/$saved" "$RUNNER_TEMP/unsaved-$ENV_NAME.tfstate"
+        echo "::error::$ENV_NAME: could not push state. Copy kept as artifact 'unsaved-state-$ENV_NAME'."
         exit 1
 
     - name: Keep unsaved state as artifact
@@ -99,6 +112,6 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: unsaved-state-${{ inputs.environment }}
-        path: ${{ runner.temp }}/unsaved-${{ inputs.environment }}.tfstate.enc
+        path: ${{ runner.temp }}/unsaved-${{ inputs.environment }}.tfstate
         if-no-files-found: ignore
         retention-days: 90

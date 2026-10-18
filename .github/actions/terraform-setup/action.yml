@@ -36,7 +36,6 @@ runs:
         #                                        because GitHub stores variable names in UPPER case)
         #   AWS_* ARM_* GOOGLE_* TF_TOKEN_*   -> other provider credentials, passed as-is (OCI handled below)
         #   TF_PLAN_ARGS                      -> extra args for terraform plan (e.g. -var-file=dev.tfvars)
-        #   TF_BACKEND_CONFIG                 -> handled in the init step below
         export_json() {
           printf '%s' "$1" | jq -r '
             to_entries[]

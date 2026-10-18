@@ -52,7 +52,7 @@
 | `OCI_FINGERPRINT` | Variable | API key fingerprint |
 | `OCI_REGION` | Variable | e.g. `eu-frankfurt-1` |
 | `OCI_PRIVATE_KEY` | **Secret** | full contents of the API key `.pem` |
-| `TF_STATE_PASSPHRASE` | **Secret** | long random password that encrypts the state files. Keep a copy somewhere safe: without it the state can't be read |
+| `TF_STATE_PASSPHRASE` | **Secret** | *optional, not set yet*. When added, state files are stored encrypted. Keep a copy safe: without it the state can't be read |
 
 **Per environment** (Settings → Environments → `dev` / `test` / `prod`)
 
@@ -61,22 +61,24 @@
 | `TF_VAR_<NAME>` | Variable/Secret | any Terraform input `<name>` (lower-cased) |
 | `TF_PLAN_ARGS` | Variable | extra plan args, e.g. `-var-file=extra.tfvars` |
 
-## State files (stored in GitHub, encrypted)
+## State files (stored in GitHub)
 
 Each env's state lives on the **`tfstate`** branch of this repo:
 
 ```
 tfstate branch
-├── dev/terraform.tfstate.enc
-├── test/terraform.tfstate.enc
-└── prod/terraform.tfstate.enc
+├── dev/terraform.tfstate
+├── test/terraform.tfstate
+└── prod/terraform.tfstate
 ```
 
-* Encrypted with AES-256 using the `TF_STATE_PASSPHRASE` secret, so the files are unreadable in this public repo.
-* **plan** downloads and decrypts the env's state, then plans against it.
-* **apply** downloads it, applies, then encrypts and commits the new state back (also after a failed apply, so partial changes are recorded). Only one apply per env runs at a time.
+* **plan** downloads the env's state, then plans against it.
+* **apply** downloads it, applies, then commits the new state back. It does this even after a failed apply, so partial changes are recorded. Only one apply per env runs at a time.
 * Every change is a commit on `tfstate`, so you get full history. To roll back, restore an older commit of that file.
 * Feature-branch plans may run with an empty state if none exists yet (harmless, plan only). On `master` a missing state **fails** the run so it can never create duplicate instances.
+
+> ⚠️ **Currently unencrypted, and this repo is public**: anyone can read the state files (IPs, OCIDs, SSH keys, any secrets in resources).
+> **To turn on encryption later:** add a repository secret `TF_STATE_PASSPHRASE` (e.g. `openssl rand -base64 32`). The next apply of each env saves it as `<env>/terraform.tfstate.enc` (AES-256) and removes the plain file. No code change needed. Note that older plain copies stay in the branch history, so also delete and recreate the `tfstate` branch, or make the repo private.
 
 ## Manual approval
 
@@ -84,18 +86,16 @@ Each env has an `<env>-approval` GitHub environment with **Required reviewers**,
 
 ## One-time setup
 
-1. **Add secret `TF_STATE_PASSPHRASE`** (Settings → Secrets and variables → Actions → Secrets). Generate one with `openssl rand -base64 32`.
-2. **Upload each env's current state** from the machine where you ran Terraform, before merging this branch:
+1. **Upload each env's current state** from the machine where you ran Terraform, before merging this branch:
    ```bash
    git clone https://github.com/upskillincloud-sha/oci-terraform && cd oci-terraform
    git checkout ci/terraform-pipeline
-   export TF_STATE_PASSPHRASE='<same value as the secret>'
    scripts/tfstate.sh push dev  ~/instance_codes/dev/terraform.tfstate
    scripts/tfstate.sh push test ~/instance_codes/test/terraform.tfstate
    scripts/tfstate.sh push prod ~/instance_codes/prod/terraform.tfstate
    ```
    (Use the real paths of your state files.)
-3. **Local runs** (optional): `scripts/tfstate.sh pull dev` gives you `dev/terraform.tfstate`. After a local apply, `scripts/tfstate.sh push dev` saves it back. Prefer applying through the pipeline so two people never apply at once.
+2. **Local runs** (optional): `scripts/tfstate.sh pull dev` gives you `dev/terraform.tfstate`. After a local apply, `scripts/tfstate.sh push dev` saves it back. Prefer applying through the pipeline so two people never apply at once.
    Credentials for local runs go in a git-ignored `local.auto.tfvars` in each env:
    ```hcl
    tenancy_ocid     = "ocid1.tenancy..."
