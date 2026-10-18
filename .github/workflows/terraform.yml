@@ -147,6 +147,16 @@ jobs:
           vars-json: ${{ toJSON(vars) }}
           secrets-json: ${{ toJSON(secrets) }}
 
+      - name: Load ${{ matrix.env }} state from GitHub
+        uses: ./.github/actions/tfstate
+        with:
+          mode: pull
+          environment: ${{ matrix.env }}
+          working-directory: ${{ env.TF_ROOT }}/${{ matrix.env }}
+          passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
+          # feature branches only plan, so an empty state is harmless there
+          allow-empty: ${{ (vars.TF_ALLOW_EMPTY_STATE == 'true' || github.ref_name != github.event.repository.default_branch) && 'true' || 'false' }}
+
       - name: terraform validate
         run: terraform validate -no-color
 
@@ -191,6 +201,8 @@ jobs:
       fail-fast: false
       matrix:
         env: ${{ fromJSON(needs.detect.outputs.envs) }}
+    permissions:
+      contents: write # saves the new state to the tfstate branch
     uses: ./.github/workflows/terraform-apply.yml
     with:
       environment: ${{ matrix.env }}

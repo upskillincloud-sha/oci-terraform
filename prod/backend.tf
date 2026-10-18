@@ -1,9 +1,9 @@
-# Remote state in OCI Object Storage. bucket/namespace/key/region are supplied at
-# init time with -backend-config (CI reads them from the TF_BACKEND_CONFIG variable).
+# State: no backend block, so Terraform uses a local terraform.tfstate.
+# In CI the pipeline downloads this env's encrypted state from the "tfstate" branch
+# before plan/apply and saves it back after apply (see PIPELINE.md).
+# Locally: scripts/tfstate.sh pull|push <env>
 terraform {
-  required_version = ">= 1.12.0"
-
-  backend "oci" {}
+  required_version = ">= 1.5.0"
 
   required_providers {
     oci = {

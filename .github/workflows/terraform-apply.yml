@@ -33,6 +33,11 @@ jobs:
     needs: approve
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    permissions:
+      contents: write # push state to the tfstate branch
+    concurrency:
+      group: tfstate-${{ inputs.environment }} # one writer per env state file at a time
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -54,5 +59,24 @@ jobs:
           vars-json: ${{ toJSON(vars) }}
           secrets-json: ${{ toJSON(secrets) }}
 
+      - name: Load ${{ inputs.environment }} state from GitHub
+        id: pull
+        uses: ./.github/actions/tfstate
+        with:
+          mode: pull
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}
+          allow-empty: ${{ vars.TF_ALLOW_EMPTY_STATE == 'true' && 'true' || 'false' }}
+
       - name: terraform apply (saved plan)
-        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Save ${{ inputs.environment }} state to GitHub
+        if: always() && steps.pull.outcome == 'success' # also after a failed apply: keeps partial changes
+        uses: ./.github/actions/tfstate
+        with:
+          mode: push
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          passphrase: ${{ secrets.TF_STATE_PASSPHRASE }}

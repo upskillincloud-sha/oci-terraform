@@ -38,7 +38,8 @@
 
 | Name | Value |
 |---|---|
-| `TF_VERSION` | `1.12.2` (≥ 1.12 needed for the OCI state backend) |
+| `TF_VERSION` | `1.12.2` |
+| `TF_ALLOW_EMPTY_STATE` | unset. Set `true` only when bringing up a brand-new env with no state yet |
 | `TF_ROOT` | `.` |
 | `TF_ENVIRONMENTS` | `dev test prod` |
 
@@ -51,14 +52,31 @@
 | `OCI_FINGERPRINT` | Variable | API key fingerprint |
 | `OCI_REGION` | Variable | e.g. `eu-frankfurt-1` |
 | `OCI_PRIVATE_KEY` | **Secret** | full contents of the API key `.pem` |
+| `TF_STATE_PASSPHRASE` | **Secret** | long random password that encrypts the state files. Keep a copy somewhere safe: without it the state can't be read |
 
 **Per environment** (Settings → Environments → `dev` / `test` / `prod`)
 
 | Name | Kind | Purpose |
 |---|---|---|
-| `TF_BACKEND_CONFIG` | Variable | state location: `bucket`, `namespace`, `key`, `region` lines |
 | `TF_VAR_<NAME>` | Variable/Secret | any Terraform input `<name>` (lower-cased) |
 | `TF_PLAN_ARGS` | Variable | extra plan args, e.g. `-var-file=extra.tfvars` |
+
+## State files (stored in GitHub, encrypted)
+
+Each env's state lives on the **`tfstate`** branch of this repo:
+
+```
+tfstate branch
+├── dev/terraform.tfstate.enc
+├── test/terraform.tfstate.enc
+└── prod/terraform.tfstate.enc
+```
+
+* Encrypted with AES-256 using the `TF_STATE_PASSPHRASE` secret, so the files are unreadable in this public repo.
+* **plan** downloads and decrypts the env's state, then plans against it.
+* **apply** downloads it, applies, then encrypts and commits the new state back (also after a failed apply, so partial changes are recorded). Only one apply per env runs at a time.
+* Every change is a commit on `tfstate`, so you get full history. To roll back, restore an older commit of that file.
+* Feature-branch plans may run with an empty state if none exists yet (harmless, plan only). On `master` a missing state **fails** the run so it can never create duplicate instances.
 
 ## Manual approval
 
@@ -66,25 +84,22 @@ Each env has an `<env>-approval` GitHub environment with **Required reviewers**,
 
 ## One-time setup
 
-1. **Create a state bucket** in OCI Object Storage, e.g. `tfstate`. Note your namespace (`oci os ns get`).
-2. **Move each env's existing state into it** from your machine, before merging this branch. Run this inside `dev/`, `test/` and `prod/`:
+1. **Add secret `TF_STATE_PASSPHRASE`** (Settings → Secrets and variables → Actions → Secrets). Generate one with `openssl rand -base64 32`.
+2. **Upload each env's current state** from the machine where you ran Terraform, before merging this branch:
    ```bash
-   cat > backend.hcl <<EOF
-   bucket    = "tfstate"
-   namespace = "<namespace>"
-   key       = "dev/terraform.tfstate"   # change per env
-   region    = "eu-frankfurt-1"
-   EOF
-   terraform init -migrate-state -backend-config=backend.hcl
+   git clone https://github.com/upskillincloud-sha/oci-terraform && cd oci-terraform
+   git checkout ci/terraform-pipeline
+   export TF_STATE_PASSPHRASE='<same value as the secret>'
+   scripts/tfstate.sh push dev  ~/instance_codes/dev/terraform.tfstate
+   scripts/tfstate.sh push test ~/instance_codes/test/terraform.tfstate
+   scripts/tfstate.sh push prod ~/instance_codes/prod/terraform.tfstate
    ```
-3. **Local runs:** create a git-ignored `local.auto.tfvars` in each env:
+   (Use the real paths of your state files.)
+3. **Local runs** (optional): `scripts/tfstate.sh pull dev` gives you `dev/terraform.tfstate`. After a local apply, `scripts/tfstate.sh push dev` saves it back. Prefer applying through the pipeline so two people never apply at once.
+   Credentials for local runs go in a git-ignored `local.auto.tfvars` in each env:
    ```hcl
    tenancy_ocid     = "ocid1.tenancy..."
    user_ocid        = "ocid1.user..."
    fingerprint      = "..."
    private_key_path = "~/.oci/oci_api_key.pem"
-   ```
-4. **GitHub side:** edit the CONFIG block in the script, then run
-   ```bash
-   ./scripts/setup-github-envs.sh upskillincloud-sha/oci-terraform <your-github-username> ~/.oci/oci_api_key.pem
    ```
