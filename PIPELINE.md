@@ -42,13 +42,20 @@
 | `TF_ROOT` | `.` |
 | `TF_ENVIRONMENTS` | `dev test prod` |
 
+**OCI credentials** (Settings → Secrets and variables → Actions). Set these once at repo level; they're shared by dev/test/prod. To use a different account for one env, add the same name on that GitHub environment, which overrides the repo value.
+
+| Name | Kind | Purpose |
+|---|---|---|
+| `OCI_TENANCY_OCID` | Variable | tenancy OCID |
+| `OCI_USER_OCID` | Variable | user OCID |
+| `OCI_FINGERPRINT` | Variable | API key fingerprint |
+| `OCI_REGION` | Variable | e.g. `eu-frankfurt-1` |
+| `OCI_PRIVATE_KEY` | **Secret** | full contents of the API key `.pem` |
+
 **Per environment** (Settings → Environments → `dev` / `test` / `prod`)
 
 | Name | Kind | Purpose |
 |---|---|---|
-| `OCI_TENANCY_OCID`, `OCI_USER_OCID`, `OCI_FINGERPRINT` | Secret | API-key auth |
-| `OCI_PRIVATE_KEY` | Secret | full contents of the API key `.pem` |
-| `OCI_REGION` | Variable | e.g. `eu-frankfurt-1` |
 | `TF_BACKEND_CONFIG` | Variable | state location: `bucket`, `namespace`, `key`, `region` lines |
 | `TF_VAR_<NAME>` | Variable/Secret | any Terraform input `<name>` (lower-cased) |
 | `TF_PLAN_ARGS` | Variable | extra plan args, e.g. `-var-file=extra.tfvars` |
