@@ -1,0 +1,91 @@
+name: Terraform setup
+description: >
+  Installs Terraform, exports config from GitHub Variables/Secrets as environment
+  variables, and runs terraform init with the env's backend config.
+
+inputs:
+  environment:
+    required: true
+  working-directory:
+    required: true
+  terraform-version:
+    required: true
+  vars-json:
+    description: toJSON(vars) from the calling job
+    required: true
+  secrets-json:
+    description: toJSON(secrets) from the calling job
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: Load config from GitHub Variables & Secrets
+      shell: bash
+      env:
+        VARS_JSON: ${{ inputs.vars-json }}
+        SECRETS_JSON: ${{ inputs.secrets-json }}
+      run: |
+        # Exported automatically:
+        #   TF_VAR_*                          -> Terraform input variables (name after TF_VAR_ is lower-cased,
+        #                                        because GitHub stores variable names in UPPER case)
+        #   AWS_* ARM_* GOOGLE_* TF_TOKEN_*   -> other provider credentials, passed as-is (OCI handled below)
+        #   TF_PLAN_ARGS                      -> extra args for terraform plan (e.g. -var-file=dev.tfvars)
+        #   TF_BACKEND_CONFIG                 -> handled in the init step below
+        export_json() {
+          printf '%s' "$1" | jq -r '
+            to_entries[]
+            | select(.key | test("^(TF_VAR_|AWS_|ARM_|GOOGLE_|TF_TOKEN_|TF_PLAN_ARGS$)"))
+            | (if (.key | startswith("TF_VAR_"))
+                 then "TF_VAR_" + (.key[7:] | ascii_downcase)
+                 else .key end) as $k
+            | "\($k)<<__TFCFG_EOF__\n\(.value)\n__TFCFG_EOF__"'
+        }
+        { export_json "$VARS_JSON"; export_json "$SECRETS_JSON"; } >> "$GITHUB_ENV"
+        echo "TF_IN_AUTOMATION=true" >> "$GITHUB_ENV"
+
+        # OCI API-key auth: secrets OCI_TENANCY_OCID, OCI_USER_OCID, OCI_FINGERPRINT,
+        # OCI_PRIVATE_KEY (full .pem contents) and variable OCI_REGION feed both the
+        # provider (TF_VAR_*) and the "oci" state backend (OCI_<lowercase> env vars).
+        get() { printf '%s\n%s' "$VARS_JSON" "$SECRETS_JSON" | jq -rs --arg k "$1" 'add | .[$k] // empty'; }
+        for pair in TENANCY_OCID:tenancy_ocid USER_OCID:user_ocid FINGERPRINT:fingerprint REGION:region; do
+          src="OCI_${pair%%:*}"; dst="${pair##*:}"; val="$(get "$src")"
+          if [ -n "$val" ]; then
+            echo "TF_VAR_${dst}=${val}" >> "$GITHUB_ENV"
+            echo "OCI_${dst}=${val}"    >> "$GITHUB_ENV"
+          fi
+        done
+        key="$(get OCI_PRIVATE_KEY)"
+        if [ -n "$key" ]; then
+          keyfile="$RUNNER_TEMP/oci_api_key.pem"
+          ( umask 077; printf '%s\n' "$key" > "$keyfile" )
+          echo "TF_VAR_private_key_path=$keyfile" >> "$GITHUB_ENV"
+          echo "OCI_private_key_path=$keyfile"    >> "$GITHUB_ENV"
+          echo "OCI_auth=APIKey"                  >> "$GITHUB_ENV"
+        else
+          echo "::warning::OCI_PRIVATE_KEY secret not set for '${{ inputs.environment }}' - OCI auth will fail"
+        fi
+        echo "Loaded config keys for ${{ inputs.environment }}:"
+        printf '%s\n%s' "$VARS_JSON" "$SECRETS_JSON" | jq -r 'keys[]' | grep -E '^(TF_|AWS_|ARM_|GOOGLE_|OCI_)' | sort -u | sed 's/^/  - /'
+
+    - name: terraform init
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BACKEND_CONFIG: ${{ fromJSON(inputs.vars-json).TF_BACKEND_CONFIG }}
+      run: |
+        args=(-input=false -no-color)
+        if [ -n "$BACKEND_CONFIG" ]; then
+          printf '%s\n' "$BACKEND_CONFIG" > "$RUNNER_TEMP/backend.hcl"
+          args+=("-backend-config=$RUNNER_TEMP/backend.hcl")
+        elif grep -qs 'backend "' ./*.tf; then
+          # Guard: without remote state, a CI apply would create every resource again.
+          echo "::error::TF_BACKEND_CONFIG variable is not set on the '${{ inputs.environment }}' GitHub environment."
+          exit 1
+        fi
+        terraform init "${args[@]}"

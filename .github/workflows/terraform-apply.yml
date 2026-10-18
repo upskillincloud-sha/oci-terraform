@@ -1,0 +1,58 @@
+# Reusable apply workflow, called once per environment from terraform.yml.
+#   approve : sits on the "<env>-approval" GitHub environment (required reviewers) -> manual gate
+#   apply   : runs on the "<env>" GitHub environment (config vars/secrets) and applies the saved plan
+
+name: Terraform apply
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      working-directory:
+        type: string
+        required: true
+      terraform-version:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  approve:
+    name: Approve ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-approval
+    steps:
+      - run: echo "Apply to ${{ inputs.environment }} approved by ${{ github.actor }}"
+
+  apply:
+    name: Apply ${{ inputs.environment }}
+    needs: approve
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Set up Terraform and load config
+        uses: ./.github/actions/terraform-setup
+        with:
+          environment: ${{ inputs.environment }}
+          working-directory: ${{ inputs.working-directory }}
+          terraform-version: ${{ inputs.terraform-version }}
+          vars-json: ${{ toJSON(vars) }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: terraform apply (saved plan)
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan

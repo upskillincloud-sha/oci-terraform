@@ -1,0 +1,180 @@
+# Terraform CI/CD
+#
+#   any branch  : fmt -> detect envs -> plan (dev / test / prod, whichever exist)
+#   default branch (master): fmt -> detect envs -> plan -> [manual approval] -> apply, per env
+#
+# All configuration comes from GitHub repository / environment Variables & Secrets.
+# See PIPELINE.md for the one-time setup.
+
+name: Terraform
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false # never interrupt a running plan/apply (state lock)
+
+env:
+  TF_ROOT: ${{ vars.TF_ROOT || '.' }}
+  TF_VERSION: ${{ vars.TF_VERSION || '1.12.2' }}
+  TF_ENVIRONMENTS: ${{ vars.TF_ENVIRONMENTS || 'dev test prod' }}
+
+jobs:
+  # ---------------------------------------------------------------- 1. format
+  fmt:
+    name: Terraform fmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # lets the job push the auto-format commit on feature branches
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Auto-format and commit (feature branches)
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          terraform fmt -recursive
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "style: terraform fmt"
+            git push
+            echo "### terraform fmt fixed and committed formatting" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### terraform fmt: already formatted" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Format check (default branch)
+        if: github.ref_name == github.event.repository.default_branch
+        run: terraform fmt -check -recursive -diff
+
+  # --------------------------------------------------------- 2a. detect envs
+  detect:
+    name: Detect environments
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.find.outputs.envs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          found=()
+          for e in $TF_ENVIRONMENTS; do
+            if [ -d "$TF_ROOT/$e" ]; then found+=("\"$e\""); fi
+          done
+          json="[$(IFS=,; echo "${found[*]}")]"
+          echo "envs=$json" >> "$GITHUB_OUTPUT"
+          echo "Environments found under $TF_ROOT/: $json"
+          echo "### Environments detected: \`$json\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------- 2b. plan
+  plan:
+    name: Plan (${{ matrix.env }})
+    needs: [fmt, detect]
+    if: needs.detect.outputs.envs != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.env }} # config vars/secrets live on this GitHub environment
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.detect.outputs.envs) }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_ROOT }}/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform and load config
+        uses: ./.github/actions/terraform-setup
+        with:
+          environment: ${{ matrix.env }}
+          working-directory: ${{ env.TF_ROOT }}/${{ matrix.env }}
+          terraform-version: ${{ env.TF_VERSION }}
+          vars-json: ${{ toJSON(vars) }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            $TF_PLAN_ARGS -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          if [ $code -eq 1 ]; then exit 1; fi
+          if [ $code -eq 2 ]; then changes=true; else changes=false; fi
+          echo "changes=$changes" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Plan: ${{ matrix.env }} (changes: $changes)"
+            echo '```'
+            terraform show -no-color tfplan | head -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save plan for apply (default branch only)
+        if: github.ref_name == github.event.repository.default_branch
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: |
+            ${{ env.TF_ROOT }}/${{ matrix.env }}/tfplan
+            ${{ env.TF_ROOT }}/${{ matrix.env }}/.terraform.lock.hcl
+          include-hidden-files: true
+          retention-days: 5
+          if-no-files-found: error
+
+  # ---------------------------------------- 3. apply (default branch, manual)
+  # Each env waits for a human to approve on its "<env>-approval" environment.
+  # Order: dev -> test -> prod. An env that doesn't exist is skipped and doesn't block the next.
+  apply-dev:
+    name: Apply dev
+    needs: [detect, plan]
+    if: github.ref_name == github.event.repository.default_branch && contains(fromJSON(needs.detect.outputs.envs), 'dev')
+    uses: ./.github/workflows/terraform-apply.yml
+    with:
+      environment: dev
+      working-directory: ${{ vars.TF_ROOT || '.' }}/dev
+      terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
+    secrets: inherit
+
+  apply-test:
+    name: Apply test
+    needs: [detect, plan, apply-dev]
+    if: >-
+      always() && github.ref_name == github.event.repository.default_branch && needs.plan.result == 'success'
+      && contains(fromJSON(needs.detect.outputs.envs), 'test')
+      && (needs.apply-dev.result == 'success' || needs.apply-dev.result == 'skipped')
+    uses: ./.github/workflows/terraform-apply.yml
+    with:
+      environment: test
+      working-directory: ${{ vars.TF_ROOT || '.' }}/test
+      terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
+    secrets: inherit
+
+  apply-prod:
+    name: Apply prod
+    needs: [detect, plan, apply-test]
+    if: >-
+      always() && github.ref_name == github.event.repository.default_branch && needs.plan.result == 'success'
+      && contains(fromJSON(needs.detect.outputs.envs), 'prod')
+      && (needs.apply-test.result == 'success' || needs.apply-test.result == 'skipped')
+    uses: ./.github/workflows/terraform-apply.yml
+    with:
+      environment: prod
+      working-directory: ${{ vars.TF_ROOT || '.' }}/prod
+      terraform-version: ${{ vars.TF_VERSION || '1.12.2' }}
+    secrets: inherit
