@@ -1,7 +1,12 @@
 # Terraform CI/CD
 #
-#   any branch  : fmt -> detect envs -> plan (dev / test / prod, whichever exist)
-#   default branch (master): fmt -> detect envs -> plan (parallel) -> [manual approval] -> apply (parallel), per env
+#   [ fmt  dev | test | prod ] --> [ plan  dev | test | prod ] --> [ apply  dev | test | prod ]
+#        parallel                      parallel                   default branch only,
+#                                                                  manual approval, parallel
+#
+#   any branch     : fmt (auto-fix) -> plan
+#   default branch : fmt (check)    -> plan -> apply (waits for approval per env)
+#   Run workflow   : Actions tab -> Terraform -> "Run workflow": pick env(s), plan only or plan + apply
 #
 # All configuration comes from GitHub repository / environment Variables & Secrets.
 # See PIPELINE.md for the one-time setup.
@@ -13,6 +18,16 @@ on:
     branches: ["**"]
     paths-ignore: ["**.md", "docs/**"]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment(s) to run
+        type: choice
+        options: [all, dev, test, prod]
+        default: all
+      apply:
+        description: Also apply (default branch only; still waits for approval)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,39 +42,7 @@ env:
   TF_ENVIRONMENTS: ${{ vars.TF_ENVIRONMENTS || 'dev test prod' }}
 
 jobs:
-  # ---------------------------------------------------------------- 1. format
-  fmt:
-    name: Terraform fmt
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # lets the job push the auto-format commit on feature branches
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - name: Auto-format and commit (feature branches)
-        if: github.ref_name != github.event.repository.default_branch
-        run: |
-          terraform fmt -recursive
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -am "style: terraform fmt"
-            git push
-            echo "### terraform fmt fixed and committed formatting" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### terraform fmt: already formatted" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Format check (default branch)
-        if: github.ref_name == github.event.repository.default_branch
-        run: terraform fmt -check -recursive -diff
-
-  # --------------------------------------------------------- 2a. detect envs
+  # ------------------------------------------------- 0. which envs exist
   detect:
     name: Detect environments
     runs-on: ubuntu-latest
@@ -68,21 +51,81 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: find
+        env:
+          ONLY: ${{ inputs.environment || 'all' }}
         run: |
           found=()
           for e in $TF_ENVIRONMENTS; do
+            if [ "$ONLY" != "all" ] && [ "$ONLY" != "$e" ]; then continue; fi
             if [ -d "$TF_ROOT/$e" ]; then found+=("\"$e\""); fi
           done
           json="[$(IFS=,; echo "${found[*]}")]"
           echo "envs=$json" >> "$GITHUB_OUTPUT"
-          echo "Environments found under $TF_ROOT/: $json"
-          echo "### Environments detected: \`$json\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Environments: \`$json\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # ------------------------------------------------------------- 2b. plan
-  plan:
-    name: Plan (${{ matrix.env }})
-    needs: [fmt, detect]
+  # ------------------------------------------------------ 1. fmt (parallel)
+  fmt:
+    name: fmt (${{ matrix.env }})
+    needs: detect
     if: needs.detect.outputs.envs != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # pushes the auto-format commit on feature branches
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.detect.outputs.envs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          IS_DEFAULT: ${{ github.ref_name == github.event.repository.default_branch }}
+        run: |
+          # This env's folder, plus shared module folders: any folder of .tf files that is not
+          # itself a root config (no provider/backend block), e.g. instance_module/.
+          shared=()
+          while read -r d; do
+            grep -qsE '^\s*(provider|backend) "' "$d"/*.tf || shared+=("$d")
+          done < <(find . -name '*.tf' -not -path './.git/*' -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
+          echo "env folder: $TF_ROOT/$ENV_NAME   shared folders: ${shared[*]:-none}"
+
+          if [ "$IS_DEFAULT" = "true" ]; then
+            terraform fmt -check -recursive -diff "$TF_ROOT/$ENV_NAME"
+            for d in "${shared[@]}"; do terraform fmt -check -diff "$d"; done
+            echo "### fmt $ENV_NAME: OK" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          terraform fmt -recursive "$TF_ROOT/$ENV_NAME"
+          for d in "${shared[@]}"; do terraform fmt "$d"; done
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "### fmt $ENV_NAME: already formatted" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "style: terraform fmt ($ENV_NAME)"
+          # the other envs' fmt jobs may push at the same moment -> rebase and retry
+          for i in 1 2 3 4 5; do
+            git pull -q --rebase origin "$GITHUB_REF_NAME" && git push -q origin "HEAD:$GITHUB_REF_NAME" && break
+            sleep $((i * 3))
+          done
+          echo "### fmt $ENV_NAME: fixed formatting and committed it" >> "$GITHUB_STEP_SUMMARY"
+          git show --stat --oneline HEAD
+
+  # ----------------------------------------------------- 2. plan (parallel)
+  plan:
+    name: plan (${{ matrix.env }})
+    needs: [detect, fmt]
     runs-on: ubuntu-latest
     environment: ${{ matrix.env }} # config vars/secrets live on this GitHub environment
     strategy:
@@ -108,7 +151,6 @@ jobs:
         run: terraform validate -no-color
 
       - name: terraform plan
-        id: plan
         run: |
           set +e
           terraform plan -input=false -no-color -lock-timeout=5m \
@@ -116,16 +158,15 @@ jobs:
           code=$?
           set -e
           if [ $code -eq 1 ]; then exit 1; fi
-          if [ $code -eq 2 ]; then changes=true; else changes=false; fi
-          echo "changes=$changes" >> "$GITHUB_OUTPUT"
+          if [ $code -eq 2 ]; then changes="changes to apply"; else changes="no changes"; fi
           {
-            echo "## Plan: ${{ matrix.env }} (changes: $changes)"
+            echo "## Plan: ${{ matrix.env }} - $changes"
             echo '```'
             terraform show -no-color tfplan | head -c 60000
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Save plan for apply (default branch only)
+      - name: Save plan for apply
         if: github.ref_name == github.event.repository.default_branch
         uses: actions/upload-artifact@v4
         with:
@@ -136,16 +177,18 @@ jobs:
           include-hidden-files: true
           retention-days: 5
           if-no-files-found: error
+          overwrite: true # re-running a plan replaces the saved plan
 
-  # ---------------------------------------- 3. apply (default branch, manual)
-  # One apply per detected env, all in parallel. Each env has its own approval gate
-  # ("<env>-approval" GitHub environment), so you can approve them together or one by one.
+  # ---------------------------------- 3. apply (parallel, manual approval)
+  # Each env pauses on its "<env>-approval" GitHub environment until someone approves it.
   apply:
-    name: Apply (${{ matrix.env }})
+    name: apply (${{ matrix.env }})
     needs: [detect, plan]
-    if: github.ref_name == github.event.repository.default_branch
+    if: >-
+      github.ref_name == github.event.repository.default_branch
+      && (github.event_name == 'push' || inputs.apply)
     strategy:
-      fail-fast: false # a failing env doesn't cancel the others
+      fail-fast: false
       matrix:
         env: ${{ fromJSON(needs.detect.outputs.envs) }}
     uses: ./.github/workflows/terraform-apply.yml
